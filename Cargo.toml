@@ -1,0 +1,9 @@
+[package]
+name = "packet_sniffer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pnet = "0.34"
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
