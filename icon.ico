@@ -1,0 +1,10 @@
+# Since we can't create a proper .ico file here, this is a placeholder
+# In a real build environment, you would:
+# 1. Create a proper icon using an image editor
+# 2. Convert it to .ico format using tools like ImageMagick or online converters
+# 3. Place it in the project root
+
+# For Inno Setup, you can use any 32x32 or 16x16 icon file
+# This file serves as documentation for the expected icon location
+
+echo "Icon file placeholder - replace with actual packet_sniffer.ico file"

@@ -1,3 +1,7 @@
+mod config;
+mod logger;
+mod error;
+
 use clap::Parser;
 use colored::*;
 use pnet::datalink::{self, NetworkInterface};
@@ -13,9 +17,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
+use std::path::PathBuf;
+use dirs;
+
+use config::Config;
+use logger::Logger;
+use error::{PacketSnifferError, Result, handle_error};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    name = "packet_sniffer",
+    author = "Packet Sniffer Team",
+    version = "1.0.0",
+    about = "Advanced Network Packet Sniffer with user-friendly interface and real-time dashboard",
+    long_about = "A powerful, user-friendly network packet analyzer that captures and analyzes network traffic in real-time. Designed to make network analysis accessible to both technical experts and everyday users."
+)]
 struct Args {
     /// Network interface to sniff on
     #[arg(short, long)]
@@ -56,6 +72,14 @@ struct Args {
     /// Show statistics summary every N seconds
     #[arg(long, default_value = "10")]
     stats_interval: u64,
+    
+    /// Configuration file path (default: ~/.config/packet_sniffer/config.json)
+    #[arg(long)]
+    config: Option<PathBuf>,
+    
+    /// Generate default configuration file and exit
+    #[arg(long)]
+    generate_config: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -86,40 +110,115 @@ struct NetworkStats {
 }
 
 fn main() {
+    // Initialize environment logger
+    env_logger::init();
+    
     let args = Args::parse();
     
+    // Handle configuration generation
+    if args.generate_config {
+        generate_default_config(&args);
+        return;
+    }
+    
+    // Load configuration
+    let config = load_configuration(&args).unwrap_or_else(|e| {
+        handle_error(&e);
+    });
+    
+    // Initialize logger
+    let mut logger = Logger::new(&config.logging).unwrap_or_else(|e| {
+        eprintln!("Failed to initialize logger: {}", e);
+        std::process::exit(1);
+    });
+    
+    logger.log_info("Starting Advanced Network Packet Sniffer v1.0.0");
+    
     if args.list_interfaces {
-        list_interfaces();
+        list_interfaces(&config, &mut logger);
         return;
     }
     
     let interface_name = match &args.interface {
         Some(name) => name.clone(),
         None => {
-            println!("{}", "❌ No interface specified.".red().bold());
-            println!("{}", "💡 Use --list-interfaces to see available interfaces.".yellow());
-            println!("{}", "📖 Example: sudo cargo run -- --interface eth0".cyan());
-            return;
+            let error = PacketSnifferError::InterfaceNotFound("No interface specified".to_string());
+            logger.log_error_with_context("Interface selection", &error);
+            handle_error(&error);
         }
     };
     
     let interface = match find_interface(&interface_name) {
         Some(iface) => iface,
         None => {
-            println!("{}", format!("❌ Interface '{}' not found.", interface_name).red().bold());
-            println!("{}", "💡 Use --list-interfaces to see available interfaces.".yellow());
-            return;
+            let error = PacketSnifferError::InterfaceNotFound(interface_name);
+            logger.log_error_with_context("Interface discovery", &error);
+            handle_error(&error);
         }
     };
     
-    if args.dashboard {
-        start_dashboard_mode(interface, args);
+    // Validate protocol filter
+    if let Some(ref protocol) = args.protocol {
+        if !is_valid_protocol(protocol) {
+            let error = PacketSnifferError::InvalidFilter(protocol.clone());
+            logger.log_error_with_context("Protocol filter validation", &error);
+            handle_error(&error);
+        }
+    }
+    
+    logger.log_packet_capture_start(&interface.name);
+    
+    let result = if args.dashboard {
+        start_dashboard_mode(interface, args, config, logger)
     } else {
-        start_sniffing(interface, args);
+        start_sniffing(interface, args, config, logger)
+    };
+    
+    if let Err(e) = result {
+        handle_error(&e);
     }
 }
 
-fn list_interfaces() {
+fn generate_default_config(args: &Args) -> ! {
+    let config_path = get_config_path(args);
+    
+    match Config::default().save(&config_path) {
+        Ok(_) => {
+            println!("✅ Default configuration generated at: {}", config_path.display());
+            println!("💡 You can now edit this file to customize the packet sniffer behavior.");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to generate configuration: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn load_configuration(args: &Args) -> Result<Config> {
+    let config_path = get_config_path(args);
+    
+    Config::load_or_create(config_path).map_err(|e| {
+        PacketSnifferError::ConfigError(format!("Failed to load configuration: {}", e))
+    })
+}
+
+fn get_config_path(args: &Args) -> PathBuf {
+    if let Some(ref path) = args.config {
+        path.clone()
+    } else {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("packet_sniffer");
+        config_dir.join("config.json")
+    }
+}
+
+fn is_valid_protocol(protocol: &str) -> bool {
+    matches!(protocol.to_lowercase().as_str(), "tcp" | "udp" | "icmp" | "http" | "dns")
+}
+
+fn list_interfaces(config: &Config, logger: &mut Logger) {
     println!("{}", "🌐 Available Network Interfaces:".green().bold());
     println!();
     
@@ -160,7 +259,7 @@ fn find_interface(name: &str) -> Option<NetworkInterface> {
         .find(|iface| iface.name == name)
 }
 
-fn start_dashboard_mode(interface: NetworkInterface, args: Args) {
+fn start_dashboard_mode(interface: NetworkInterface, args: Args, config: Config, mut logger: Logger) -> Result<()> {
     println!("{}", "🚀 Starting Interactive Dashboard Mode".green().bold());
     println!("{}", format!("📡 Interface: {}", interface.name).cyan());
     println!("{}", "Press Ctrl+C to stop".yellow());
@@ -193,7 +292,13 @@ fn start_dashboard_mode(interface: NetworkInterface, args: Args) {
         
         // Break on Ctrl+C (simplified version)
         // In a real implementation, you'd use signal handling
+        // For now, this is an infinite loop that can only be stopped with Ctrl+C
     }
+    
+    // This line will never be reached due to infinite loop above
+    // but is needed for compilation
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 fn capture_packets_with_stats(interface: NetworkInterface, args: Args, stats: std::sync::Arc<std::sync::Mutex<NetworkStats>>, captured_packets: std::sync::Arc<std::sync::Mutex<Vec<PacketInfo>>>) {
@@ -478,8 +583,10 @@ fn format_packet_description(packet_info: &PacketInfo) -> String {
     }
 }
 
-fn start_sniffing(interface: NetworkInterface, args: Args) {
+fn start_sniffing(interface: NetworkInterface, args: Args, config: Config, mut logger: Logger) -> Result<()> {
     use pnet::datalink::Channel::Ethernet;
+    
+    let start_time = Instant::now();
     
     println!("{}", "🚀 Starting Advanced Packet Capture".green().bold());
     println!("{}", format!("📡 Interface: {}", interface.name).cyan());
@@ -499,12 +606,10 @@ fn start_sniffing(interface: NetworkInterface, args: Args) {
     let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => {
-            println!("{}", "❌ Unhandled channel type".red());
-            return;
+            return Err(PacketSnifferError::NetworkError("Unhandled channel type".to_string()));
         }
         Err(e) => {
-            println!("{}", format!("❌ Failed to create datalink channel: {}", e).red());
-            return;
+            return Err(PacketSnifferError::NetworkError(format!("Failed to create datalink channel: {}", e)));
         }
     };
     
@@ -552,12 +657,17 @@ fn start_sniffing(interface: NetworkInterface, args: Args) {
     
     // Export if requested
     if let Some(ref json_file) = args.export_json {
-        export_to_json(&captured_packets, json_file);
+        export_to_json(&captured_packets, json_file)?;
+        logger.log_export("JSON", json_file, captured_packets.len());
     }
     
     if let Some(ref csv_file) = args.export_csv {
-        export_to_csv(&captured_packets, csv_file);
+        export_to_csv(&captured_packets, csv_file)?;
+        logger.log_export("CSV", csv_file, captured_packets.len());
     }
+    
+    logger.log_packet_capture_stop(captured_packets.len(), start_time.elapsed().as_secs());
+    Ok(())
 }
 
 fn display_packet_simple(packet_info: &PacketInfo) {
@@ -694,36 +804,25 @@ fn display_final_summary(packets: &[PacketInfo], duration: Duration) {
     println!("{}", "═".repeat(80).blue());
 }
 
-fn export_to_json(packets: &[PacketInfo], filename: &str) {
-    match serde_json::to_string_pretty(packets) {
-        Ok(json_data) => {
-            if std::fs::write(filename, json_data).is_ok() {
-                println!("{}", format!("✅ Exported {} packets to {}", packets.len(), filename).green());
-            } else {
-                println!("{}", format!("❌ Failed to write JSON file: {}", filename).red());
-            }
-        }
-        Err(e) => {
-            println!("{}", format!("❌ Failed to serialize data: {}", e).red());
-        }
-    }
+fn export_to_json(packets: &[PacketInfo], filename: &str) -> Result<()> {
+    let json_data = serde_json::to_string_pretty(packets)
+        .map_err(|e| PacketSnifferError::ExportError(format!("Failed to serialize data: {}", e)))?;
+    
+    std::fs::write(filename, json_data)
+        .map_err(|e| PacketSnifferError::ExportError(format!("Failed to write JSON file: {}", e)))?;
+    
+    println!("{}", format!("✅ Exported {} packets to {}", packets.len(), filename).green());
+    Ok(())
 }
 
-fn export_to_csv(packets: &[PacketInfo], filename: &str) {
-    let mut wtr = match csv::Writer::from_path(filename) {
-        Ok(writer) => writer,
-        Err(e) => {
-            println!("{}", format!("❌ Failed to create CSV file: {}", e).red());
-            return;
-        }
-    };
+fn export_to_csv(packets: &[PacketInfo], filename: &str) -> Result<()> {
+    let mut wtr = csv::Writer::from_path(filename)
+        .map_err(|e| PacketSnifferError::ExportError(format!("Failed to create CSV file: {}", e)))?;
     
     // Write header
-    if wtr.write_record(&["timestamp", "packet_number", "src_ip", "dst_ip", "protocol", 
-                         "src_port", "dst_port", "packet_size", "flags", "application_protocol", "description"]).is_err() {
-        println!("{}", "❌ Failed to write CSV header".red());
-        return;
-    }
+    wtr.write_record(&["timestamp", "packet_number", "src_ip", "dst_ip", "protocol", 
+                       "src_port", "dst_port", "packet_size", "flags", "application_protocol", "description"])
+        .map_err(|e| PacketSnifferError::ExportError(format!("Failed to write CSV header: {}", e)))?;
     
     // Write data
     for packet in packets {
@@ -741,17 +840,15 @@ fn export_to_csv(packets: &[PacketInfo], filename: &str) {
             packet.description.clone(),
         ];
         
-        if wtr.write_record(&record).is_err() {
-            println!("{}", "❌ Failed to write CSV record".red());
-            return;
-        }
+        wtr.write_record(&record)
+            .map_err(|e| PacketSnifferError::ExportError(format!("Failed to write CSV record: {}", e)))?;
     }
     
-    if wtr.flush().is_ok() {
-        println!("{}", format!("✅ Exported {} packets to {}", packets.len(), filename).green());
-    } else {
-        println!("{}", format!("❌ Failed to finalize CSV file: {}", filename).red());
-    }
+    wtr.flush()
+        .map_err(|e| PacketSnifferError::ExportError(format!("Failed to flush CSV file: {}", e)))?;
+    
+    println!("{}", format!("✅ Exported {} packets to {}", packets.len(), filename).green());
+    Ok(())
 }
 
 fn should_capture_packet(packet: &[u8], args: &Args) -> bool {

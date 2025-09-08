@@ -1,1 +1,48 @@
 /target
+
+# Rust
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/dist
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Configuration files (except defaults)
+config.json
+*.log
+
+# Export files
+exports/
+*.json
+*.csv
+
+# Temporary files
+/tmp
+*.tmp
+
+# Package files
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+*.msi
+
+# Windows specific
+*.pdb
+
+# Backup files
+*.bak
+*~

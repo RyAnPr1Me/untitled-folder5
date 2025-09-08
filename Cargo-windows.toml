@@ -1,17 +1,7 @@
 [package]
-name = "packet_sniffer"
+name = "packet_sniffer_windows"
 version = "1.0.0"
 edition = "2021"
-authors = ["Packet Sniffer Team"]
-description = "Advanced Network Packet Sniffer with user-friendly interface and real-time dashboard"
-license = "MIT"
-readme = "README.md"
-keywords = ["network", "packet", "sniffer", "analysis", "monitoring"]
-categories = ["network-programming", "command-line-utilities"]
-
-[[bin]]
-name = "packet_sniffer"
-path = "src/main.rs"
 
 [dependencies]
 pnet = "0.34"
@@ -29,6 +19,14 @@ log = "0.4"
 env_logger = "0.10"
 dirs = "5.0"
 anyhow = "1.0"
+winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv"] }
+
+[[bin]]
+name = "packet_sniffer"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv"] }
 
 [profile.release]
 opt-level = 3
@@ -36,3 +34,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.win]
+manifest = "packet_sniffer.exe.manifest"
