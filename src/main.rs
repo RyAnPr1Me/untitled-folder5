@@ -98,6 +98,46 @@ struct PacketInfo {
     payload_size: usize,
     application_protocol: Option<String>,
     description: String,
+    threat_level: ThreatLevel,
+    geo_info: Option<GeoInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd)]
+enum ThreatLevel {
+    Safe,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct GeoInfo {
+    country: Option<String>,
+    city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionFlow {
+    src_ip: String,
+    dst_ip: String,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
+    protocol: String,
+    packet_count: usize,
+    total_bytes: usize,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    threat_level: ThreatLevel,
+}
+
+#[derive(Debug, Clone)]
+struct BandwidthPoint {
+    timestamp: DateTime<Utc>,
+    bytes_per_sec: f64,
+    packets_per_sec: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +147,14 @@ struct NetworkStats {
     protocol_counts: HashMap<String, usize>,
     top_talkers: HashMap<String, usize>,
     start_time: Instant,
+    bandwidth_history: Vec<BandwidthPoint>,
+    connections: HashMap<String, ConnectionFlow>,
+    threat_alerts: Vec<(DateTime<Utc>, String, ThreatLevel)>,
+    port_activity: HashMap<u16, usize>,
+    packet_sizes: Vec<usize>,
+    current_connections: usize,
+    peak_bandwidth: f64,
+    peak_packets_per_sec: f64,
 }
 
 fn main() {
@@ -271,6 +319,14 @@ fn start_dashboard_mode(interface: NetworkInterface, args: Args, config: Config,
         protocol_counts: HashMap::new(),
         top_talkers: HashMap::new(),
         start_time: Instant::now(),
+        bandwidth_history: Vec::new(),
+        connections: HashMap::new(),
+        threat_alerts: Vec::new(),
+        port_activity: HashMap::new(),
+        packet_sizes: Vec::new(),
+        current_connections: 0,
+        peak_bandwidth: 0.0,
+        peak_packets_per_sec: 0.0,
     }));
     
     let captured_packets = Arc::new(Mutex::new(Vec::<PacketInfo>::new()));
@@ -335,9 +391,95 @@ fn capture_packets_with_stats(interface: NetworkInterface, args: Args, stats: st
                         stats.total_bytes += packet_info.packet_size;
                         *stats.protocol_counts.entry(packet_info.protocol.clone()).or_insert(0) += 1;
                         
+                        // Track packet sizes for analysis
+                        stats.packet_sizes.push(packet_info.packet_size);
+                        if stats.packet_sizes.len() > 1000 {
+                            stats.packet_sizes.remove(0);
+                        }
+                        
+                        // Track port activity
+                        if let Some(port) = packet_info.dst_port.or(packet_info.src_port) {
+                            *stats.port_activity.entry(port).or_insert(0) += 1;
+                        }
+                        
+                        // Track top talkers
                         if let Some(src_ip) = &packet_info.src_ip {
                             *stats.top_talkers.entry(src_ip.clone()).or_insert(0) += 1;
                         }
+                        
+                        // Track threat alerts
+                        if packet_info.threat_level != ThreatLevel::Safe {
+                            let alert_msg = format!("Suspicious {} traffic from {} to {}", 
+                                packet_info.protocol,
+                                packet_info.src_ip.as_ref().unwrap_or(&"unknown".to_string()),
+                                packet_info.dst_ip.as_ref().unwrap_or(&"unknown".to_string())
+                            );
+                            stats.threat_alerts.push((packet_info.timestamp, alert_msg, packet_info.threat_level.clone()));
+                            
+                            // Keep only last 100 alerts
+                            if stats.threat_alerts.len() > 100 {
+                                stats.threat_alerts.remove(0);
+                            }
+                        }
+                        
+                        // Track connections
+                        if let (Some(src_ip), Some(dst_ip)) = (&packet_info.src_ip, &packet_info.dst_ip) {
+                            let connection_key = format!("{}:{}-{}:{}", 
+                                src_ip, packet_info.src_port.unwrap_or(0),
+                                dst_ip, packet_info.dst_port.unwrap_or(0)
+                            );
+                            
+                            let connection = stats.connections.entry(connection_key.clone()).or_insert(ConnectionFlow {
+                                src_ip: src_ip.clone(),
+                                dst_ip: dst_ip.clone(),
+                                src_port: packet_info.src_port,
+                                dst_port: packet_info.dst_port,
+                                protocol: packet_info.protocol.clone(),
+                                packet_count: 0,
+                                total_bytes: 0,
+                                first_seen: packet_info.timestamp,
+                                last_seen: packet_info.timestamp,
+                                threat_level: packet_info.threat_level.clone(),
+                            });
+                            
+                            connection.packet_count += 1;
+                            connection.total_bytes += packet_info.packet_size;
+                            connection.last_seen = packet_info.timestamp;
+                            
+                            // Update threat level if higher
+                            if packet_info.threat_level > connection.threat_level {
+                                connection.threat_level = packet_info.threat_level.clone();
+                            }
+                        }
+                        
+                        // Calculate bandwidth stats every few seconds
+                        let elapsed = stats.start_time.elapsed().as_secs();
+                        if elapsed > 0 && stats.total_packets % 100 == 0 {
+                            let bytes_per_sec = stats.total_bytes as f64 / elapsed as f64;
+                            let packets_per_sec = stats.total_packets as f64 / elapsed as f64;
+                            
+                            stats.bandwidth_history.push(BandwidthPoint {
+                                timestamp: packet_info.timestamp,
+                                bytes_per_sec,
+                                packets_per_sec,
+                            });
+                            
+                            // Update peaks
+                            if bytes_per_sec > stats.peak_bandwidth {
+                                stats.peak_bandwidth = bytes_per_sec;
+                            }
+                            if packets_per_sec > stats.peak_packets_per_sec {
+                                stats.peak_packets_per_sec = packets_per_sec;
+                            }
+                            
+                            // Keep only last 100 bandwidth points
+                            if stats.bandwidth_history.len() > 100 {
+                                stats.bandwidth_history.remove(0);
+                            }
+                        }
+                        
+                        // Update current connections count
+                        stats.current_connections = stats.connections.len();
                     }
                     
                     // Store packet info
@@ -366,55 +508,66 @@ fn display_dashboard(stats: &std::sync::Arc<std::sync::Mutex<NetworkStats>>, cap
     let stats = stats.lock().unwrap();
     let packets = captured_packets.lock().unwrap();
     
-    println!("{}", "📊 Network Traffic Dashboard".green().bold());
-    println!("{}", "═".repeat(80).blue());
+    // Clear screen and display header
+    println!("{}", "\x1B[2J\x1B[1;1H");
+    println!("{}", "🚀 ADVANCED NETWORK TRAFFIC DASHBOARD".green().bold());
+    println!("{}", "═".repeat(100).blue());
     
     let duration = stats.start_time.elapsed().as_secs();
     let packets_per_sec = if duration > 0 { stats.total_packets as f64 / duration as f64 } else { 0.0 };
     let bytes_per_sec = if duration > 0 { stats.total_bytes as f64 / duration as f64 } else { 0.0 };
     
-    // Summary stats
-    println!("⏱️  Duration: {}s | 📦 Packets: {} ({:.1}/s) | 📊 Bytes: {} ({:.1}/s)", 
-             duration, stats.total_packets, packets_per_sec, 
-             format_bytes(stats.total_bytes), bytes_per_sec);
+    // Main statistics overview
+    println!("⏱️  {} {} {} {} {} {} {} {}", 
+             "Duration:".cyan(), format!("{}s", duration).yellow().bold(),
+             "| 📦 Packets:".cyan(), format!("{} ({:.1}/s)", stats.total_packets, packets_per_sec).yellow().bold(),
+             "| 📊 Data:".cyan(), format!("{} ({:.1}/s)", format_bytes(stats.total_bytes), bytes_per_sec).yellow().bold(),
+             "| 🔗 Connections:".cyan(), format!("{}", stats.current_connections).yellow().bold()
+    );
+    
+    // Performance metrics
+    println!("⚡ {} {} {} {}", 
+             "Peak Bandwidth:".cyan(), format!("{}/s", format_bytes(stats.peak_bandwidth as usize)).red().bold(),
+             "| Peak Packets:".cyan(), format!("{:.1}/s", stats.peak_packets_per_sec).red().bold()
+    );
     println!();
     
-    // Protocol distribution
-    println!("{}", "🔗 Protocol Distribution:".yellow().bold());
-    let mut protocol_table = Table::new();
-    protocol_table.add_row(Row::new(vec![
-        Cell::new("Protocol").style_spec("Fb"),
-        Cell::new("Packets").style_spec("Fb"),
-        Cell::new("Percentage").style_spec("Fb"),
-    ]));
+    // Real-time bandwidth graph (ASCII art)
+    display_bandwidth_graph(&stats.bandwidth_history);
     
-    for (protocol, count) in &stats.protocol_counts {
-        let percentage = (*count as f64 / stats.total_packets as f64) * 100.0;
-        protocol_table.add_row(Row::new(vec![
-            Cell::new(protocol),
-            Cell::new(&count.to_string()),
-            Cell::new(&format!("{:.1}%", percentage)),
-        ]));
-    }
-    protocol_table.printstd();
+    // Security threat indicators
+    display_threat_dashboard(&stats.threat_alerts, &packets);
     
-    // Recent packets
-    println!("\n{}", "📋 Recent Packets:".yellow().bold());
-    if packets.len() > 0 {
-        let recent_packets: Vec<_> = packets.iter().rev().take(5).collect();
-        for packet in recent_packets {
-            let timestamp = packet.timestamp.format("%H:%M:%S").to_string();
-            println!("🕐 {} | {} | {} | {}", 
-                     timestamp.cyan(),
-                     packet.protocol.green(),
-                     format!("{} -> {}", 
-                            packet.src_ip.as_ref().unwrap_or(&"N/A".to_string()),
-                            packet.dst_ip.as_ref().unwrap_or(&"N/A".to_string())).blue(),
-                     packet.description.white());
-        }
-    } else {
-        println!("No packets captured yet...");
-    }
+    // Split dashboard into columns
+    println!("{}", "┌─────────────────────────────────────────────────┬─────────────────────────────────────────────────┐".blue());
+    print!("{}", "│".blue());
+    print!("{:^49}", "🔗 PROTOCOL ANALYSIS".yellow().bold());
+    print!("{}", "│".blue());
+    print!("{:^49}", "🌍 TOP CONNECTIONS".yellow().bold());
+    println!("{}", "│".blue());
+    println!("{}", "├─────────────────────────────────────────────────┼─────────────────────────────────────────────────┤".blue());
+    
+    // Display protocol stats and top connections side by side
+    display_protocol_and_connections(&stats);
+    
+    println!("{}", "└─────────────────────────────────────────────────┴─────────────────────────────────────────────────┘".blue());
+    
+    // Port activity analysis
+    display_port_activity(&stats.port_activity);
+    
+    // Packet size distribution
+    display_packet_size_analysis(&stats.packet_sizes);
+    
+    // Geographic distribution
+    display_geographic_analysis(&packets);
+    
+    // Recent activity stream
+    display_recent_activity(&packets);
+    
+    // Footer with controls
+    println!("\n{}", "═".repeat(100).blue());
+    println!("{}", "💡 CONTROLS: [Ctrl+C] Exit | [Space] Pause | [F] Filter | [E] Export | [H] Help".cyan());
+    println!("{}", format!("📡 Last Updated: {}", Utc::now().format("%H:%M:%S UTC")).bright_black());
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -428,6 +581,289 @@ fn format_bytes(bytes: usize) -> String {
     }
     
     format!("{:.1} {}", size, UNITS[unit_index])
+}
+
+fn display_bandwidth_graph(bandwidth_history: &Vec<BandwidthPoint>) {
+    println!("{}", "📈 REAL-TIME BANDWIDTH GRAPH".yellow().bold());
+    
+    if bandwidth_history.is_empty() {
+        println!("   {}", "No data available yet...".bright_black());
+        println!();
+        return;
+    }
+    
+    let max_bytes = bandwidth_history.iter()
+        .map(|p| p.bytes_per_sec)
+        .fold(0.0, f64::max)
+        .max(1.0); // Prevent division by zero
+    
+    println!("   {} {}/s", "Peak:".cyan(), format_bytes(max_bytes as usize).red().bold());
+    
+    // ASCII graph
+    for point in bandwidth_history.iter().rev().take(20).rev() {
+        let bar_length = ((point.bytes_per_sec / max_bytes) * 40.0) as usize;
+        let bar = "█".repeat(bar_length);
+        let time = point.timestamp.format("%H:%M:%S").to_string();
+        println!("   {} │{:<40}│ {}", 
+                 time.bright_black(), 
+                 bar.green(), 
+                 format_bytes(point.bytes_per_sec as usize).cyan());
+    }
+    println!();
+}
+
+fn display_threat_dashboard(threat_alerts: &Vec<(DateTime<Utc>, String, ThreatLevel)>, packets: &Vec<PacketInfo>) {
+    let threat_counts = packets.iter().fold([0; 5], |mut acc, packet| {
+        match packet.threat_level {
+            ThreatLevel::Safe => acc[0] += 1,
+            ThreatLevel::Low => acc[1] += 1,
+            ThreatLevel::Medium => acc[2] += 1,
+            ThreatLevel::High => acc[3] += 1,
+            ThreatLevel::Critical => acc[4] += 1,
+        }
+        acc
+    });
+    
+    let total_threats = threat_counts[1] + threat_counts[2] + threat_counts[3] + threat_counts[4];
+    
+    println!("{} {} {}", 
+             "🛡️  SECURITY STATUS:".yellow().bold(),
+             if total_threats == 0 { "✅ SECURE".green().bold() } else { "⚠️  THREATS DETECTED".red().bold() },
+             format!("({} alerts)", threat_alerts.len()).bright_black()
+    );
+    
+    // Threat level bars
+    let threat_bar = format!("Safe:{} Low:{} Med:{} High:{} Crit:{}", 
+                            threat_counts[0], threat_counts[1], threat_counts[2], threat_counts[3], threat_counts[4]);
+    println!("   {}", threat_bar.cyan());
+    
+    // Recent threat alerts
+    if !threat_alerts.is_empty() {
+        println!("   {} Recent Alerts:", "🚨".red());
+        for (timestamp, message, level) in threat_alerts.iter().rev().take(3) {
+            let level_icon = match level {
+                ThreatLevel::Low => "🟡",
+                ThreatLevel::Medium => "🟠", 
+                ThreatLevel::High => "🔴",
+                ThreatLevel::Critical => "💀",
+                _ => "⚪",
+            };
+            println!("   {} {} {}", 
+                     level_icon, 
+                     timestamp.format("%H:%M:%S").to_string().bright_black(),
+                     message.yellow());
+        }
+    }
+    println!();
+}
+
+fn display_protocol_and_connections(stats: &NetworkStats) {
+    // Prepare protocol data
+    let mut protocols: Vec<_> = stats.protocol_counts.iter().collect();
+    protocols.sort_by(|a, b| b.1.cmp(a.1));
+    
+    // Prepare connection data
+    let mut connections: Vec<_> = stats.connections.iter().collect();
+    connections.sort_by(|a, b| b.1.packet_count.cmp(&a.1.packet_count));
+    
+    let max_rows = std::cmp::max(protocols.len(), connections.len().min(8));
+    
+    for i in 0..max_rows.max(5) {
+        print!("{}", "│".blue());
+        
+        // Protocol column
+        if i < protocols.len() {
+            let (protocol, count) = protocols[i];
+            let percentage = (*count as f64 / stats.total_packets as f64) * 100.0;
+            print!(" {:<12} {:>8} {:>6.1}%{:>18}", 
+                   protocol.green(), 
+                   count.to_string().yellow(), 
+                   percentage,
+                   "");
+        } else {
+            print!("{:49}", "");
+        }
+        
+        print!("{}", "│".blue());
+        
+        // Connection column
+        if i < connections.len() && i < 8 {
+            let (_, connection) = connections[i];
+            let threat_icon = match connection.threat_level {
+                ThreatLevel::Safe => "✅",
+                ThreatLevel::Low => "🟡",
+                ThreatLevel::Medium => "🟠",
+                ThreatLevel::High => "🔴", 
+                ThreatLevel::Critical => "💀",
+            };
+            
+            let conn_display = format!("{}→{}", 
+                connection.src_ip.split('.').last().unwrap_or("?"),
+                connection.dst_ip.split('.').last().unwrap_or("?"));
+            
+            print!(" {} {:<15} {:>8} {:>8}", 
+                   threat_icon,
+                   conn_display.blue(),
+                   connection.packet_count.to_string().yellow(),
+                   format_bytes(connection.total_bytes).cyan());
+        } else {
+            print!("{:49}", "");
+        }
+        
+        println!("{}", "│".blue());
+    }
+}
+
+fn display_port_activity(port_activity: &HashMap<u16, usize>) {
+    println!("{}", "🚪 TOP PORT ACTIVITY".yellow().bold());
+    
+    if port_activity.is_empty() {
+        println!("   {}", "No port activity recorded yet...".bright_black());
+        println!();
+        return;
+    }
+    
+    let mut ports: Vec<_> = port_activity.iter().collect();
+    ports.sort_by(|a, b| b.1.cmp(a.1));
+    
+    print!("   ");
+    for (port, count) in ports.iter().take(10) {
+        let port_color = match **port {
+            80 | 443 => "green",
+            22 | 23 => "yellow", 
+            53 => "blue",
+            _ if **port > 1024 => "cyan",
+            _ => "red",
+        };
+        
+        print!("{}:{} ", 
+               match port_color {
+                   "green" => format!("{}", port).green(),
+                   "yellow" => format!("{}", port).yellow(),
+                   "blue" => format!("{}", port).blue(),
+                   "cyan" => format!("{}", port).cyan(),
+                   _ => format!("{}", port).red(),
+               },
+               count.to_string().bright_black());
+    }
+    println!("\n");
+}
+
+fn display_packet_size_analysis(packet_sizes: &Vec<usize>) {
+    println!("{}", "📏 PACKET SIZE DISTRIBUTION".yellow().bold());
+    
+    if packet_sizes.is_empty() {
+        println!("   {}", "No packet size data available...".bright_black());
+        println!();
+        return;
+    }
+    
+    let avg_size = packet_sizes.iter().sum::<usize>() as f64 / packet_sizes.len() as f64;
+    let min_size = packet_sizes.iter().min().unwrap_or(&0);
+    let max_size = packet_sizes.iter().max().unwrap_or(&0);
+    
+    // Size categories
+    let small = packet_sizes.iter().filter(|&&s| s < 100).count();
+    let medium = packet_sizes.iter().filter(|&&s| s >= 100 && s < 500).count();
+    let large = packet_sizes.iter().filter(|&&s| s >= 500 && s < 1500).count();
+    let jumbo = packet_sizes.iter().filter(|&&s| s >= 1500).count();
+    
+    println!("   {} {} {} {} {} {} {} {}", 
+             "Avg:".cyan(), format!("{}B", avg_size as usize).yellow(),
+             "Range:".cyan(), format!("{}-{}B", min_size, max_size).yellow(),
+             "Small:".cyan(), small.to_string().green(),
+             "Large:".cyan(), (large + jumbo).to_string().red());
+    
+    // Simple histogram
+    let total = packet_sizes.len();
+    let small_bar = "█".repeat((small * 30 / total.max(1)).min(30));
+    let medium_bar = "█".repeat((medium * 30 / total.max(1)).min(30));
+    let large_bar = "█".repeat(((large + jumbo) * 30 / total.max(1)).min(30));
+    
+    println!("   <100B  │{:<30}│ {}%", small_bar.green(), (small * 100 / total.max(1)));
+    println!("   100-500│{:<30}│ {}%", medium_bar.yellow(), (medium * 100 / total.max(1)));
+    println!("   >500B  │{:<30}│ {}%", large_bar.red(), ((large + jumbo) * 100 / total.max(1)));
+    println!();
+}
+
+fn display_geographic_analysis(packets: &Vec<PacketInfo>) {
+    println!("{}", "🌍 GEOGRAPHIC DISTRIBUTION".yellow().bold());
+    
+    let mut country_counts = HashMap::new();
+    for packet in packets.iter().rev().take(500) {
+        if let Some(ref geo) = packet.geo_info {
+            if let Some(ref country) = geo.country {
+                *country_counts.entry(country.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    
+    if country_counts.is_empty() {
+        println!("   {}", "No geographic data available...".bright_black());
+        println!();
+        return;
+    }
+    
+    let mut countries: Vec<_> = country_counts.iter().collect();
+    countries.sort_by(|a, b| b.1.cmp(a.1));
+    
+    print!("   ");
+    for (country, count) in countries.iter().take(6) {
+        let flag = match country.as_str() {
+            "United States" => "🇺🇸",
+            "United Kingdom" => "🇬🇧", 
+            "Australia" => "🇦🇺",
+            "Germany" => "🇩🇪",
+            "France" => "🇫🇷",
+            "Local Network" => "🏠",
+            _ => "🌐",
+        };
+        
+        print!("{} {}: {} ", flag, country.cyan(), count.to_string().yellow());
+    }
+    println!("\n");
+}
+
+fn display_recent_activity(packets: &Vec<PacketInfo>) {
+    println!("{}", "📋 LIVE ACTIVITY STREAM".yellow().bold());
+    
+    if packets.is_empty() {
+        println!("   {}", "Waiting for network activity...".bright_black());
+        println!();
+        return;
+    }
+    
+    for packet in packets.iter().rev().take(8) {
+        let timestamp = packet.timestamp.format("%H:%M:%S%.1f").to_string();
+        let threat_icon = match packet.threat_level {
+            ThreatLevel::Safe => "✅",
+            ThreatLevel::Low => "🟡",
+            ThreatLevel::Medium => "🟠", 
+            ThreatLevel::High => "🔴",
+            ThreatLevel::Critical => "💀",
+        };
+        
+        let app_proto = packet.application_protocol.as_ref()
+            .map(|s| format!(" ({})", s))
+            .unwrap_or_default();
+            
+        let geo_info = packet.geo_info.as_ref()
+            .and_then(|g| g.country.as_ref())
+            .map(|c| if c == "Local Network" { "🏠" } else { "🌐" })
+            .unwrap_or("");
+        
+        println!("   {} {} {} {} {} → {} {} {}{}", 
+                 threat_icon,
+                 timestamp.bright_black(),
+                 packet.protocol.green().bold(),
+                 app_proto.yellow(),
+                 packet.src_ip.as_ref().unwrap_or(&"?".to_string()).blue(),
+                 packet.dst_ip.as_ref().unwrap_or(&"?".to_string()).blue(),
+                 geo_info,
+                 format_bytes(packet.packet_size).cyan(),
+                 if packet.packet_size > 1000 { " 📈" } else { "" });
+    }
+    println!();
 }
 
 fn analyze_packet_advanced(packet: &[u8], packet_num: usize) -> PacketInfo {
@@ -449,6 +885,8 @@ fn analyze_packet_advanced(packet: &[u8], packet_num: usize) -> PacketInfo {
         payload_size: 0,
         application_protocol: None,
         description: "Unknown packet".to_string(),
+        threat_level: ThreatLevel::Safe,
+        geo_info: None,
     };
     
     if let Some(ethernet_packet) = EthernetPacket::new(packet) {
@@ -517,6 +955,14 @@ fn analyze_packet_advanced(packet: &[u8], packet_num: usize) -> PacketInfo {
         }
     }
     
+    // Add threat detection
+    packet_info.threat_level = detect_threat_level(&packet_info);
+    
+    // Add geographical information (simplified for demo)
+    if let Some(ref dst_ip) = packet_info.dst_ip {
+        packet_info.geo_info = get_geo_info(dst_ip);
+    }
+    
     packet_info
 }
 
@@ -543,6 +989,102 @@ fn detect_application_protocol(port: u16, payload: &[u8]) -> Option<String> {
         993 => Some("IMAPS".to_string()),
         995 => Some("POP3S".to_string()),
         _ => None,
+    }
+}
+
+fn detect_threat_level(packet_info: &PacketInfo) -> ThreatLevel {
+    // Sophisticated threat detection based on multiple factors
+    let mut risk_score = 0;
+    
+    // Check for suspicious ports
+    if let Some(port) = packet_info.dst_port.or(packet_info.src_port) {
+        match port {
+            // High-risk ports
+            1433 | 3389 | 5900 | 23 | 135 | 139 | 445 => risk_score += 3,
+            // Medium-risk ports  
+            21 | 25 | 110 | 143 | 993 | 995 => risk_score += 2,
+            // Unusual high ports
+            p if p > 49152 => risk_score += 1,
+            _ => {}
+        }
+    }
+    
+    // Check for suspicious IP patterns
+    if let Some(ref ip) = packet_info.dst_ip {
+        // Private IP ranges are generally safer
+        if !is_private_ip(ip) {
+            risk_score += 1;
+        }
+        
+        // Check for known malicious patterns (simplified)
+        if ip.starts_with("10.0.0.") || ip.starts_with("169.254.") {
+            risk_score += 2;
+        }
+    }
+    
+    // Check packet size anomalies
+    if packet_info.packet_size > 1500 || packet_info.packet_size < 64 {
+        risk_score += 1;
+    }
+    
+    // Check for suspicious protocols
+    match packet_info.protocol.as_str() {
+        "ICMP" => risk_score += 1, // Could be scanning
+        "UDP" if packet_info.dst_port == Some(53) => {}, // DNS is normal
+        "UDP" => risk_score += 1, // Other UDP could be suspicious
+        _ => {}
+    }
+    
+    // Convert risk score to threat level
+    match risk_score {
+        0..=1 => ThreatLevel::Safe,
+        2..=3 => ThreatLevel::Low,
+        4..=5 => ThreatLevel::Medium,
+        6..=7 => ThreatLevel::High,
+        _ => ThreatLevel::Critical,
+    }
+}
+
+fn is_private_ip(ip: &str) -> bool {
+    ip.starts_with("10.") || 
+    ip.starts_with("192.168.") || 
+    ip.starts_with("172.16.") ||
+    ip.starts_with("127.") ||
+    ip.starts_with("::1") ||
+    ip.starts_with("fe80::")
+}
+
+fn get_geo_info(ip: &str) -> Option<GeoInfo> {
+    // Simplified geolocation (in production, use MaxMind GeoIP2 or similar)
+    if is_private_ip(ip) {
+        return Some(GeoInfo {
+            country: Some("Local Network".to_string()),
+            city: Some("Local".to_string()),
+            latitude: None,
+            longitude: None,
+        });
+    }
+    
+    // For demo purposes, return some sample data based on IP patterns
+    match ip {
+        ip if ip.starts_with("8.8.") => Some(GeoInfo {
+            country: Some("United States".to_string()),
+            city: Some("Mountain View".to_string()),
+            latitude: Some(37.4056),
+            longitude: Some(-122.0775),
+        }),
+        ip if ip.starts_with("1.1.") => Some(GeoInfo {
+            country: Some("Australia".to_string()),
+            city: Some("Sydney".to_string()),
+            latitude: Some(-33.8688),
+            longitude: Some(151.2093),
+        }),
+        _ => Some(GeoInfo {
+            country: Some("Unknown".to_string()),
+            city: Some("Unknown".to_string()),
+            latitude: None,
+            longitude: None,
+        }),
     }
 }
 
