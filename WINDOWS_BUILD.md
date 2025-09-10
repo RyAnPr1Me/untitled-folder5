@@ -53,20 +53,109 @@
 
 ## Creating Windows Installer
 
+### Automated Build Process (Recommended)
+
+#### Method 1: PowerShell Script
+```powershell
+# Full build with installer
+.\build_windows.ps1
+
+# Build with verbose output
+.\build_windows.ps1 -Verbose
+
+# Build without installer creation
+.\build_windows.ps1 -SkipInstaller
+```
+
+#### Method 2: Batch Script
+```cmd
+# Run automated build
+build_windows.bat
+```
+
+Both scripts will:
+1. Clean previous builds
+2. Verify Rust installation
+3. Build release version
+4. Create distribution structure
+5. Copy all necessary files
+6. Generate default configuration
+7. Compile Inno Setup installer (if available)
+
+### Manual Inno Setup Compilation
+
 1. **Install Inno Setup**
    - Download from https://jrsoftware.org/isinfo.php
    - Install with full components
 
-2. **Prepare installer files**
-   - Ensure all files are in the correct locations as specified in installer.iss
-   - Verify packet_sniffer.exe is in target\release\
-   - Create or replace icon.ico with a proper icon file
+2. **Prepare build files**
+   ```cmd
+   # Build the application
+   cargo build --release
+   
+   # Create distribution structure
+   mkdir dist config docs
+   
+   # Generate configuration
+   target\release\packet_sniffer.exe --generate-config --config config\default_config.json
+   ```
 
 3. **Compile installer**
-   - Open Inno Setup Compiler
-   - Open installer.iss
-   - Click Build > Compile
-   - The installer will be created in the dist\ directory
+   
+   **Option A: GUI Method**
+   - Open Inno Setup
+   - File → Open → `installer.iss`
+   - Build → Compile
+   
+   **Option B: Command Line**
+   ```cmd
+   "C:\Program Files (x86)\Inno Setup 6\iscc.exe" installer.iss
+   ```
+   
+   **Option C: Context Menu**
+   - Right-click `installer.iss`
+   - Select "Compile"
+
+4. **Output**
+   - Installer created: `dist\PacketSnifferSetup-1.0.0.exe`
+   - Size: ~15-25 MB (including dependencies)
+   - Features: Professional installer with dependency management
+
+### Installer Features
+
+The Inno Setup installer includes:
+
+#### Professional Installation Experience
+- Modern wizard-style interface
+- Multi-language support (English, Spanish, French, German, Japanese)
+- Component selection (Full, Compact, Custom)
+- Optional features (desktop shortcuts, PATH integration, firewall config)
+
+#### Dependency Management
+- **Npcap Driver Detection**: Automatically checks and prompts for installation
+- **Visual C++ Redistributable**: Silent installation if needed
+- **Administrator Privileges**: Validates and requires elevation
+
+#### Advanced Configuration
+- **System Integration**: Optional PATH addition and Windows service installation
+- **Security**: Windows Firewall exception configuration
+- **Documentation**: Complete help system with examples and guides
+- **Uninstaller**: Clean removal with registry cleanup
+
+#### Installation Locations
+```
+Program Files:
+  C:\Program Files\Advanced Network Packet Sniffer\
+  ├── packet_sniffer.exe
+  ├── config\default_config.json
+  ├── docs\
+  └── README.md, examples.md, etc.
+
+User Data:
+  %APPDATA%\packet_sniffer\
+  ├── exports\
+  └── logs\
+```
 
 ## Prerequisites for Users
 
