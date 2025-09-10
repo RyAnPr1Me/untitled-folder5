@@ -1,0 +1,39 @@
+[package]
+name = "packet_sniffer_windows"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+pnet = "0.34"
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.3"
+colored = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.0"
+reqwest = { version = "0.11", features = ["json"] }
+prettytable-rs = "0.10"
+log = "0.4"
+env_logger = "0.10"
+dirs = "5.0"
+anyhow = "1.0"
+winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv"] }
+
+[[bin]]
+name = "packet_sniffer"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[package.metadata.win]
+manifest = "packet_sniffer.exe.manifest"
